@@ -419,4 +419,42 @@ router.get('/liked-barbers', auth, async (req, res) => {
   }
 });
 
+// @route   POST api/auth/likeSalon
+// @desc    Like a salon
+// @access  Private
+router.post('/likeSalon', auth, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    const { salonId } = req.body;
+
+    if (!user.likedSalons.includes(salonId)) {
+      user.likedSalons.push(salonId);
+      await user.save();
+    }
+
+    res.json(user);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Server Error');
+  }
+});
+
+// @route   POST api/auth/unlikeSalon
+// @desc    Unlike a salon
+// @access  Private
+router.post('/unlikeSalon', auth, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    const { salonId } = req.body;
+
+    user.likedSalons = user.likedSalons.filter(id => id.toString() !== salonId);
+    await user.save();
+
+    res.json(user);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Server Error');
+  }
+});
+
 module.exports = router;

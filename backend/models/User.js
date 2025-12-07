@@ -66,6 +66,10 @@ const userSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Shop'
   }],
+  likedSalons: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Shop'
+  }],
 });
 
 const User = mongoose.model('User', userSchema);
