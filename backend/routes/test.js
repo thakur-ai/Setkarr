@@ -19,4 +19,9 @@ router.delete('/clear-locked-places', async (req, res) => {
   }
 });
 
+// Simple JSON ping for quick reachability checks from devices
+router.get('/ping', (req, res) => {
+  res.json({ ok: true, time: Date.now() });
+});
+
 module.exports = router;

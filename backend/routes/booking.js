@@ -3,6 +3,7 @@ const router = express.Router();
 const Booking = require('../models/Booking');
 const Notification = require('../models/Notification');
 const User = require('../models/User');
+const SetkarCoinTransaction = require('../models/SetkarCoinTransaction');
 const auth = require('../middleware/auth');
 
 // Helper function to get priority value
@@ -35,7 +36,7 @@ const getPriorityValue = (appointment) => {
 router.get('/history', auth, async (req, res) => {
   try {
     const bookings = await Booking.find({ userId: req.user.id, status: { $ne: 'cancelled' } })
-      .populate('barberId', 'name email phone address rating reviews shopName shopAddress shopPhone shopRating shopReviews') // Populate barberId with all relevant fields
+      .populate('barberId', 'name email phone address rating reviews profilePicture shopName shopAddress shopPhone shopRating shopReviews') // Populate barberId including profilePicture
       .select('+otp') // Include the OTP field
       .sort({ date: -1 });
     res.json(bookings);
@@ -68,12 +69,14 @@ router.get('/barber', auth, async (req, res) => {
 router.get('/:id', auth, async (req, res) => {
   try {
     const booking = await Booking.findById(req.params.id)
-      .populate('barberId', 'name phone') // Populate barberId with 'name' and 'phone'
+      .populate('barberId', 'name email phone address rating reviews profilePicture shopName shopAddress shopPhone') // Populate barberId including all necessary fields
       .populate('userId', 'name email profilePicture phone gender language');
     if (!booking) {
       return res.status(404).json({ msg: 'Booking not found' });
     }
-    res.json(booking);
+    // Return booking with OTP for authenticated users (for display on website)
+    const bookingResponse = await Booking.findById(booking._id).select('+otp').populate('barberId', 'name email phone address rating reviews profilePicture shopName shopAddress shopPhone');
+    res.json(bookingResponse);
   } catch (err) {
     console.error(err.message);
     res.status(500).json({ msg: err.message });
@@ -246,6 +249,20 @@ router.put('/decline/:id', auth, async (req, res) => {
     }).sort({ createdAt: -1 });
 
     if (displacedBooking) {
+      // Remove booking total price from Setkar Coins if reinstated
+      const displacedUser = await User.findById(displacedBooking.userId);
+      if (displacedUser) {
+        displacedUser.setkarCoins = Math.max(0, (displacedUser.setkarCoins || 0) - displacedBooking.totalPrice);
+        await displacedUser.save();
+
+        const notification = new Notification({
+          userId: displacedUser._id,
+          title: 'Booking Reinstated',
+          message: `Your previously cancelled booking with a higher priority booking has been reinstated. ${displacedBooking.totalPrice} Setkar Coins have been removed from your account.`,
+        });
+        await notification.save();
+      }
+
       displacedBooking.status = 'confirmed';
       displacedBooking.cancellationReason = '';
       await displacedBooking.save();
@@ -466,9 +483,50 @@ router.put('/complete/:id', auth, async (req, res) => {
 
     const updatedBooking = await Booking.findById(req.params.id).populate('userId', 'name email profilePicture phone gender language');
 
-    // Create a notification for the user
+    // Award 1 Setkar coin to the user upon booking completion
     const user = await User.findById(booking.userId);
     if (user) {
+      // Increment completed bookings count
+      user.completedBookings = (user.completedBookings || 0) + 1;
+
+      // Award regular coin
+      user.setkarCoins = (user.setkarCoins || 0) + 1;
+
+      // Check for loyalty program milestone (every 10 bookings)
+      const currentMilestone = Math.floor((user.completedBookings - 1) / 10) + 1; // Current milestone before this booking
+      const newMilestone = Math.floor(user.completedBookings / 10); // New milestone after this booking
+
+      let loyaltyReward = 0;
+      if (newMilestone > currentMilestone) {
+        // User reached a new milestone
+        loyaltyReward = 10; // Award 10 coins for every 10 bookings
+        user.setkarCoins += loyaltyReward;
+        user.loyaltyRewardsEarned = (user.loyaltyRewardsEarned || 0) + 1;
+        user.lastLoyaltyRewardDate = new Date();
+      }
+
+      await user.save();
+
+      // Create transaction record for regular coin
+      const regularTransaction = new SetkarCoinTransaction({
+        userId: user._id,
+        type: 'recharge',
+        amount: 1,
+        description: `Earned 1 Setkar Coin for completing booking`,
+      });
+      await regularTransaction.save();
+
+      // Create transaction record for loyalty reward if applicable
+      if (loyaltyReward > 0) {
+        const loyaltyTransaction = new SetkarCoinTransaction({
+          userId: user._id,
+          type: 'recharge',
+          amount: loyaltyReward,
+          description: `Loyalty reward: ${loyaltyReward} Setkar Coins for completing ${user.completedBookings} bookings`,
+        });
+        await loyaltyTransaction.save();
+      }
+
       const bookingDate = new Date(booking.date);
       const [hours, minutes] = booking.time.split(':');
       bookingDate.setHours(hours);
@@ -487,10 +545,15 @@ router.put('/complete/:id', auth, async (req, res) => {
         timeZone: 'Asia/Kolkata',
       });
 
+      let notificationMessage = `Your booking with ${req.user.name} on ${formattedDate} at ${formattedTime} has been completed. You earned 1 Setkar Coin!`;
+      if (loyaltyReward > 0) {
+        notificationMessage += ` 🎉 Loyalty bonus: ${loyaltyReward} extra coins for completing ${user.completedBookings} bookings!`;
+      }
+
       const notification = new Notification({
         userId: user._id,
         title: 'Booking Completed',
-        message: `Your booking with ${req.user.name} on ${formattedDate} at ${formattedTime} has been completed.`,
+        message: notificationMessage,
       });
       await notification.save();
     }
@@ -589,10 +652,31 @@ router.post('/', auth, async (req, res) => {
 
         const cancelledUser = await User.findById(bookingToCancel.userId);
         if (cancelledUser) {
+          let coinsToAdd = 0;
+          switch (bookingToCancel.appointmentType) {
+            case 'Free':
+              coinsToAdd = 0;
+              break;
+            case 'Basic':
+              coinsToAdd = 3;
+              break;
+            case 'Premium':
+              coinsToAdd = 10;
+              break;
+            case 'Black Premium':
+              coinsToAdd = 15;
+              break;
+            default:
+              coinsToAdd = 0; // Default to 0 if type is unrecognized
+          }
+
+          cancelledUser.setkarCoins = (cancelledUser.setkarCoins || 0) + coinsToAdd;
+          await cancelledUser.save();
+
           const notification = new Notification({
             userId: cancelledUser._id,
             title: 'Booking Cancelled',
-            message: `Your booking with ${barber.name} has been cancelled due to a higher priority booking.`,
+            message: `Your booking with ${barber.name} has been cancelled due to a higher priority booking. ${coinsToAdd} Setkar Coins have been added to your account.`,
           });
           await notification.save();
         }
@@ -667,7 +751,7 @@ router.post('/', auth, async (req, res) => {
 });
 
 // @route   GET api/booking/daily-counts/:barberId
-// @desc    Get daily appointment counts by type for a specific barber
+// @desc    Get daily appointhdjhuryitloaggdftywuiloment counts by type for a specific barber
 // @access  Private (or Public if needed for customer-facing availability)
 router.get('/daily-counts/:barberId', auth, async (req, res) => {
   try {
@@ -803,6 +887,296 @@ router.get('/check-premium-availability/:barberId', auth, async (req, res) => {
     console.log(`Found ${replaceableBookings} replaceable bookings for barber ${barberId}`);
 
     res.json({ type: 'premium', count: replaceableBookings });
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ msg: err.message });
+  }
+});
+
+// @route   GET api/booking/website/barber-queue/:barberId
+// @desc    Get barber's queue for a specific date for website (public access, same logic as mobile Appointmentcheckpage)
+// @access  Public
+router.get('/website/barber-queue/:barberId', async (req, res) => {
+  try {
+    const { barberId } = req.params;
+    const { date } = req.query;
+
+    if (!date) {
+      return res.status(400).json({ msg: 'Date query parameter is required' });
+    }
+
+    const queryDate = new Date(date);
+    queryDate.setHours(0, 0, 0, 0);
+    const nextDay = new Date(queryDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+
+    const bookings = await Booking.find({
+      barberId: barberId,
+      date: {
+        $gte: queryDate,
+        $lt: nextDay,
+      },
+      status: { $ne: 'cancelled' },
+    }).populate('userId', 'name _id').populate('services', 'name price').select('customerName isOfflineBooking date time appointmentType totalPrice status services paymentStatus').sort({ createdAt: 1 });
+
+    // Sort by priority (same logic as Appointmentcheckpage.jsx)
+    bookings.sort((a, b) => {
+      const priorityA = getPriorityValue(a);
+      const priorityB = getPriorityValue(b);
+      if (priorityA !== priorityB) {
+        return priorityA - priorityB;
+      }
+      // Secondary sort by time for same priority
+      if (typeof a.time === 'string' && typeof b.time === 'string' && a.time && b.time) {
+        try {
+          const timeA = new Date(`1970/01/01 ${a.time}`);
+          const timeB = new Date(`1970/01/01 ${b.time}`);
+          if (!isNaN(timeA) && !isNaN(timeB)) {
+            return timeA - timeB;
+          }
+        } catch (e) {
+          console.error("Error parsing time for backend sorting:", e);
+        }
+      }
+      return new Date(a.createdAt) - new Date(b.createdAt);
+    });
+
+    res.json(bookings);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ msg: err.message });
+  }
+});
+
+// @route   GET api/booking/public/barber-queue/:barberId
+// @desc    Get barber's queue for a specific date (public access for queue checking)
+// @access  Public
+router.get('/public/barber-queue/:barberId', async (req, res) => {
+  try {
+    const { barberId } = req.params;
+    const { date } = req.query;
+
+    if (!date) {
+      return res.status(400).json({ msg: 'Date query parameter is required' });
+    }
+
+    const queryDate = new Date(date);
+    queryDate.setHours(0, 0, 0, 0);
+    const nextDay = new Date(queryDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+
+    const bookings = await Booking.find({
+      barberId: barberId,
+      date: {
+        $gte: queryDate,
+        $lt: nextDay,
+      },
+      status: { $ne: 'cancelled' },
+    }).populate('userId', 'name _id').populate('services', 'name price').select('customerName isOfflineBooking date time appointmentType totalPrice status services paymentStatus').sort({ createdAt: 1 });
+
+    const priorityMap = {
+      'Black Premium': 1,
+      'Premium': 2,
+      'Basic': 3,
+      'Free': 4,
+    };
+
+    bookings.sort((a, b) => {
+      const priorityA = getPriorityValue(a);
+      const priorityB = getPriorityValue(b);
+      if (priorityA !== priorityB) {
+        return priorityA - priorityB;
+      }
+      // Secondary sort by time for same priority
+      if (typeof a.time === 'string' && typeof b.time === 'string' && a.time && b.time) {
+        try {
+          const timeA = new Date(`1970/01/01 ${a.time}`);
+          const timeB = new Date(`1970/01/01 ${b.time}`);
+          if (!isNaN(timeA) && !isNaN(timeB)) {
+            return timeA - timeB;
+          }
+        } catch (e) {
+          console.error("Error parsing time for backend sorting:", e, "Appointment A:", a, "Appointment B:", b);
+        }
+      }
+      return new Date(a.createdAt) - new Date(b.createdAt);
+    });
+
+    res.json(bookings);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ msg: err.message });
+  }
+});
+
+// @route   POST api/booking/public
+// @desc    Create a public booking (no authentication required)
+// @access  Public
+router.post('/public', async (req, res) => {
+  console.log('Public booking endpoint called');
+  console.log('Public booking request body:', req.body);
+  const { barberId, date, time, services, totalPrice, appointmentType, customerInfo } = req.body;
+
+  try {
+    const barber = await User.findById(barberId);
+    if (!barber) {
+      return res.status(404).json({ msg: 'Barber not found' });
+    }
+
+    const today = new Date(date);
+    today.setHours(0, 0, 0, 0);
+
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    const todaysBookings = await Booking.countDocuments({
+      barberId,
+      date: {
+        $gte: today,
+        $lt: tomorrow,
+      },
+      status: { $ne: 'cancelled' },
+    });
+
+    if (todaysBookings >= barber.maxAppointmentsPerDay) {
+      if (appointmentType !== 'Black Premium') {
+        return res.status(400).json({ msg: 'This barber is fully booked for today.' });
+      }
+
+      const priority = ['Free', 'Basic', 'Premium'];
+      let bookingToCancel = null;
+
+      for (const type of priority) {
+        const bookings = await Booking.find({
+          barberId,
+          date: { $gte: today, $lt: tomorrow },
+          status: { $nin: ['started', 'completed', 'cancelled'] },
+          appointmentType: type,
+        }).sort({ createdAt: -1 });
+
+        if (bookings.length > 0) {
+          bookingToCancel = bookings[0];
+          break;
+        }
+      }
+
+      if (bookingToCancel) {
+        bookingToCancel.status = 'cancelled';
+        bookingToCancel.cancellationReason = 'Cancelled due to a higher priority booking.';
+        await bookingToCancel.save();
+
+        const cancelledUser = await User.findById(bookingToCancel.userId);
+        if (cancelledUser) {
+          let coinsToAdd = 0;
+          switch (bookingToCancel.appointmentType) {
+            case 'Free':
+              coinsToAdd = 0;
+              break;
+            case 'Basic':
+              coinsToAdd = 3;
+              break;
+            case 'Premium':
+              coinsToAdd = 10;
+              break;
+            case 'Black Premium':
+              coinsToAdd = 15;
+              break;
+            default:
+              coinsToAdd = 0; // Default to 0 if type is unrecognized
+          }
+
+          cancelledUser.setkarCoins = (cancelledUser.setkarCoins || 0) + coinsToAdd;
+          await cancelledUser.save();
+
+          const notification = new Notification({
+            userId: cancelledUser._id,
+            title: 'Booking Cancelled',
+            message: `Your booking with ${barber.name} has been cancelled due to a higher priority booking. ${coinsToAdd} Setkar Coins have been added to your account.`,
+          });
+          await notification.save();
+        }
+      } else {
+        return res.status(400).json({ msg: 'This barber is fully booked with high priority appointments.' });
+      }
+    }
+
+    // For public bookings, set as offline booking with customer info
+    const newBooking = new Booking({
+      userId: undefined, // No authenticated user
+      barberId,
+      date,
+      time,
+      services,
+      totalPrice,
+      appointmentType,
+      isOfflineBooking: true, // Mark as offline/public booking
+      customerName: customerInfo.name,
+      customerPhone: customerInfo.phone,
+      paymentStatus: 'pending', // Public bookings start as pending
+      status: 'pending'
+    });
+
+    const booking = await newBooking.save();
+
+    // Create a notification for the barber
+    const barberForNotification = await User.findById(barberId);
+    if (barberForNotification) {
+      const bookingDate = new Date(date);
+      const [hours, minutes] = time.split(':');
+      bookingDate.setHours(hours);
+      bookingDate.setMinutes(minutes);
+
+      const formattedDate = bookingDate.toLocaleDateString('en-IN', {
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric',
+        timeZone: 'Asia/Kolkata',
+      });
+      const formattedTime = bookingDate.toLocaleTimeString('en-IN', {
+        hour: 'numeric',
+        minute: 'numeric',
+        hour12: true,
+        timeZone: 'Asia/Kolkata',
+      });
+
+      const serviceNames = Array.isArray(services) ? services.map(service => service.name).join(', ') : 'a service';
+
+      const notification = new Notification({
+        userId: barberForNotification._id,
+        title: 'New Public Booking',
+        message: `You have a new public booking from ${customerInfo.name} (${customerInfo.phone}) for ${serviceNames} on ${formattedDate} at ${formattedTime}.`,
+      });
+      await notification.save();
+    }
+
+    res.json(booking);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ msg: err.message });
+  }
+});
+
+// @route   PUT api/booking/update-payment/:id
+// @desc    Update booking payment status
+// @access  Private
+router.put('/update-payment/:id', auth, async (req, res) => {
+  try {
+    const { paymentStatus, paymentMethod, transactionId, paymentAmount } = req.body;
+    const booking = await Booking.findById(req.params.id);
+
+    if (!booking) {
+      return res.status(404).json({ msg: 'Booking not found' });
+    }
+
+    // Update payment information
+    if (paymentStatus) booking.paymentStatus = paymentStatus;
+    if (paymentMethod) booking.paymentMethod = paymentMethod;
+    if (transactionId) booking.transactionId = transactionId;
+    if (paymentAmount) booking.paymentAmount = paymentAmount;
+
+    await booking.save();
+
+    res.json(booking);
   } catch (err) {
     console.error(err.message);
     res.status(500).json({ msg: err.message });

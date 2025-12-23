@@ -26,7 +26,7 @@ const bookingSchema = new mongoose.Schema({
   services: [{
     id: String,
     name: String,
-    price: String,
+    price: Number,
   }],
   date: {
     type: Date,

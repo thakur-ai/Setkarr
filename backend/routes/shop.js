@@ -26,12 +26,139 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage });
 
+// Helper function to calculate barber score based on rating and review count
+function calculateBarberScore(rating, reviewCount) {
+  // Primary factor: rating (0-5)
+  // Secondary factor: review count (logarithmic to prevent very high review counts from dominating)
+  // This gives higher weight to rating but also considers review volume
+  const reviewWeight = Math.log(reviewCount + 1) / Math.log(100); // Normalize review count impact
+  return rating * (1 + reviewWeight * 0.1); // Rating gets 90-100% weight, reviews add up to 10%
+}
+
+// @route   GET api/shop/featured-barbers
+// @desc    Get top-rated barbers from each service provider type for featured section
+// @access  Public
+router.get('/featured-barbers', async (req, res) => {
+  try {
+    // Define the categories we want to feature
+    const categories = ["Barber", "Women's Salon", "Pet Care"];
+
+    const featuredBarbers = [];
+
+    // For each category, get the top-rated barber (considering both rating and review count)
+    for (const category of categories) {
+      // Find shops in this category (confirmed or not, for featured display)
+      const shops = await Shop.find({
+        category
+      })
+      .populate('owner', 'name email phone profilePicture shopName shopAddress shopPhone')
+      .populate({
+        path: 'selectedListingPlace',
+        populate: {
+          path: 'lockedBy',
+          select: 'name profilePicture',
+        },
+      });
+
+      if (shops.length > 0) {
+        // Find the shop with the best-rated barber in this category
+        // Prioritize by rating score (not listing tier)
+        let topShop = shops[0];
+        let bestScore = calculateBarberScore(topShop.rating || 0, topShop.reviews || 0);
+
+        for (const shop of shops) {
+          const score = calculateBarberScore(shop.rating || 0, shop.reviews || 0);
+          if (score > bestScore) {
+            bestScore = score;
+            topShop = shop;
+          }
+        }
+
+        // Transform the data to match the frontend expected format
+        const barber = topShop.owner;
+        const lowestServicePrice = topShop.services && topShop.services.length > 0
+          ? Math.min(...topShop.services.map(service => parseFloat(service.price) || 0))
+          : 200; // Default price
+
+        // Use shop's real rating, or generate realistic rating if shop has no rating
+        let displayRating = topShop.rating || 0;
+        if (displayRating === 0) {
+          // Generate a realistic rating between 3.5 and 5.0
+          displayRating = 3.5 + Math.random() * 1.5;
+        }
+
+        featuredBarbers.push({
+          id: barber._id,
+          name: topShop.name || barber.name,
+          rating: displayRating,
+          distance: '2.5 km', // This would need to be calculated based on user location
+          price: lowestServicePrice,
+          nextSlot: '10:30 AM', // This would need to be calculated based on availability
+          img: barber.profilePicture || 'https://images.unsplash.com/photo-1585747860715-2ba37e788b70?w=800&q=80',
+          verified: true, // Assuming all listed shops are verified
+          shopAddress: topShop.address,
+          shopPhone: topShop.phone,
+          category: topShop.category,
+          services: topShop.services || []
+        });
+      }
+    }
+
+    // Sort by rating (highest first) to ensure the best ones appear first
+    featuredBarbers.sort((a, b) => b.rating - a.rating);
+
+    res.json(featuredBarbers);
+  } catch (err) {
+    console.error('Error fetching featured barbers:', err);
+    res.status(500).json({ msg: 'Server Error', error: err.message });
+  }
+});
+
+// @route   POST api/shop
+// @desc    Create a new shop for the current user
+// @access  Private
+router.post('/', auth, async (req, res) => {
+  const { name, address, phone, category } = req.body;
+
+  try {
+    // Check if user already owns a shop
+    const existingShop = await Shop.findOne({ owner: req.user.id });
+    if (existingShop) {
+      return res.status(400).json({ msg: 'You already own a shop' });
+    }
+
+    // Check if user is staff at another shop
+    const staffShop = await Shop.findOne({ staff: req.user.id });
+    if (staffShop) {
+      // Allow staff to create their own shop
+      // Remove them from the staff array of the previous shop
+      staffShop.staff = staffShop.staff.filter(id => id.toString() !== req.user.id);
+      await staffShop.save();
+    }
+
+    // Create new shop
+    const shop = new Shop({
+      owner: req.user.id,
+      name,
+      address,
+      phone,
+      category,
+    });
+
+    await shop.save();
+    res.json(shop);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Server Error');
+  }
+});
+
 // @route   GET api/shop
-// @desc    Get or create current user's shop
+// @desc    Get current user's shop (only if they own one)
 // @access  Private
 router.get('/', auth, async (req, res) => {
   try {
-    let shop = await Shop.findOne({ owner: req.user.id }).populate({
+    const shop = await Shop.findOne({ owner: req.user.id }).populate({
       path: 'selectedListingPlace',
       populate: {
         path: 'lockedBy',
@@ -40,14 +167,7 @@ router.get('/', auth, async (req, res) => {
     });
 
     if (!shop) {
-      // If no shop exists, create one for the barber
-      shop = new Shop({
-        owner: req.user.id,
-        name: 'My Shop', // Default name
-        address: 'Not set',
-        phone: 'Not set',
-      });
-      await shop.save();
+      return res.status(404).json({ msg: 'Shop not found - you may not own a shop or be staff at one' });
     }
 
     res.json(shop);
@@ -178,9 +298,46 @@ router.get('/all', async (req, res) => {
         status: { $ne: 'cancelled' },
       });
 
+      // Calculate shop rating as average of all barbers (owner + staff)
+      let totalRating = shop.rating || 0;
+      let totalReviews = shop.reviews || 0;
+      let barberCount = 1; // Start with owner
+
+      // Add ratings from staff members
+      if (shop.staff && shop.staff.length > 0) {
+        console.log(`Shop ${shop._id} has ${shop.staff.length} staff members`);
+        for (const staffId of shop.staff) {
+          try {
+            // Get staff member rating from User model (not Shop model)
+            const User = require('../models/User');
+            const staffUser = await User.findById(staffId).select('rating reviews');
+            if (staffUser) {
+              console.log(`Staff ${staffId}: rating=${staffUser.rating}, reviews=${staffUser.reviews}`);
+              // Include staff even with rating 0, but only count towards average if they have a rating
+              totalReviews += staffUser.reviews || 0;
+              if (staffUser.rating > 0) {
+                totalRating += staffUser.rating;
+                barberCount++;
+              }
+            } else {
+              console.log(`Staff ${staffId} not found in User model`);
+            }
+          } catch (err) {
+            console.error('Error fetching staff rating:', err);
+          }
+        }
+      } else {
+        console.log(`Shop ${shop._id} has no staff members`);
+      }
+
+      const averageRating = barberCount > 0 ? totalRating / barberCount : 0;
+
       return {
         ...shop.toObject(),
         todaysBookings,
+        shopRating: averageRating,
+        totalBarbers: barberCount,
+        totalReviews: totalReviews,
       };
     }));
 
@@ -216,6 +373,50 @@ router.get('/locked-places', async (req, res) => {
   }
 });
 
+// @route   GET api/shop/my-shop
+// @desc    Get shop where user is either owner or staff member
+// @access  Private
+router.get('/my-shop', auth, async (req, res) => {
+  try {
+    // First try to find shop where user is the owner
+    let shop = await Shop.findOne({ owner: req.user.id })
+      .populate('staff', 'name email phone profilePicture rating reviews') // Populate staff details
+      .populate({
+        path: 'selectedListingPlace',
+        populate: {
+          path: 'lockedBy',
+          select: 'name profilePicture',
+        },
+      });
+
+    if (!shop) {
+      // If not owner, check if user is staff at any shop
+      shop = await Shop.findOne({ staff: req.user.id })
+        .populate('owner', 'name email phone profilePicture rating reviews') // Populate owner details
+        .populate('staff', 'name email phone profilePicture rating reviews') // Populate all staff details
+        .populate({
+          path: 'selectedListingPlace',
+          populate: {
+            path: 'lockedBy',
+            select: 'name profilePicture',
+          },
+        });
+    }
+
+    if (!shop) {
+      return res.status(404).json({ msg: 'No shop found for this user' });
+    }
+
+    // Add a flag to indicate if user is the main owner
+    const isMainOwner = shop.owner._id.toString() === req.user.id;
+
+    res.json({ ...shop.toObject(), isMainOwner });
+  } catch (err) {
+    console.error('Error fetching user shop:', err);
+    res.status(500).json({ msg: 'Server Error', error: err.message });
+  }
+});
+
 // @route   GET api/shop/barber/:barberId
 // @desc    Get shop by barber (owner) ID
 // @access  Public
@@ -241,7 +442,14 @@ router.get('/:id', async (req, res) => {
     if (!shop) {
       return res.status(404).json({ msg: 'Shop not found' });
     }
-    res.json(shop);
+
+    // Calculate customers served
+    const customersServed = await Booking.distinct('userId', {
+      barberId: shop.owner._id,
+      status: { $ne: 'cancelled' },
+    });
+
+    res.json({ ...shop.toObject(), customersServed: customersServed.length });
   } catch (err) {
     console.error(err.message);
     if (err.kind === 'ObjectId') {
@@ -455,6 +663,93 @@ router.get('/services/:userId', auth, async (req, res) => {
   } catch (err) {
     console.error('Error fetching services by user ID:', err);
     res.status(500).send('Server Error');
+  }
+});
+
+// @route   POST api/shop/staff
+// @desc    Add staff member to shop (only owner can do this)
+// @access  Private
+router.post('/staff', auth, async (req, res) => {
+  const { staffId } = req.body;
+
+  try {
+    const shop = await Shop.findOne({ owner: req.user.id });
+
+    if (!shop) {
+      return res.status(404).json({ msg: 'Shop not found' });
+    }
+
+    // Check if the staff member is already in the staff array
+    if (shop.staff.includes(staffId)) {
+      return res.status(400).json({ msg: 'Staff member already added to this shop' });
+    }
+
+    // Check if the staff member exists and is a barber
+    const User = require('../models/User');
+    const staffUser = await User.findById(staffId);
+    if (!staffUser || staffUser.role !== 'barber') {
+      return res.status(400).json({ msg: 'Invalid staff member - must be a barber' });
+    }
+
+    // Check if the staff member already owns a shop
+    const existingShop = await Shop.findOne({ owner: staffId });
+    if (existingShop) {
+      return res.status(400).json({ msg: 'Staff member already owns a shop' });
+    }
+
+    // Check if the staff member is already staff at another shop
+    const otherShop = await Shop.findOne({ staff: staffId });
+    if (otherShop) {
+      return res.status(400).json({ msg: 'Staff member is already working at another shop' });
+    }
+
+    shop.staff.push(staffId);
+    await shop.save();
+
+    res.json({ success: true, msg: 'Staff member added successfully', shop });
+  } catch (err) {
+    console.error('Error adding staff:', err);
+    res.status(500).json({ msg: 'Server Error', error: err.message });
+  }
+});
+
+// @route   DELETE api/shop/staff/:staffId
+// @desc    Remove staff member from shop (only owner can do this)
+// @access  Private
+router.delete('/staff/:staffId', auth, async (req, res) => {
+  try {
+    const shop = await Shop.findOne({ owner: req.user.id });
+
+    if (!shop) {
+      return res.status(404).json({ msg: 'Shop not found' });
+    }
+
+    // Remove the staff member from the staff array
+    shop.staff = shop.staff.filter(id => id.toString() !== req.params.staffId);
+    await shop.save();
+
+    res.json({ success: true, msg: 'Staff member removed successfully', shop });
+  } catch (err) {
+    console.error('Error removing staff:', err);
+    res.status(500).json({ msg: 'Server Error', error: err.message });
+  }
+});
+
+// @route   GET api/shop/staff
+// @desc    Get staff members for current user's shop
+// @access  Private
+router.get('/staff', auth, async (req, res) => {
+  try {
+    const shop = await Shop.findOne({ owner: req.user.id }).populate('staff', 'name email phone profilePicture');
+
+    if (!shop) {
+      return res.status(404).json({ msg: 'Shop not found' });
+    }
+
+    res.json(shop.staff);
+  } catch (err) {
+    console.error('Error fetching staff:', err);
+    res.status(500).json({ msg: 'Server Error', error: err.message });
   }
 });
 

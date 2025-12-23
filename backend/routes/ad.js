@@ -37,53 +37,92 @@ function checkFileType(file, cb) {
   }
 }
 
-// Create a new ad placement
-router.post('/', auth, upload.single('media'), async (req, res) => {
-  try {
-    const { videoUrl, startDate, endDate, price } = req.body;
-    const barberId = req.user.id; // Assuming auth middleware adds user to req
-
-    // Check if any ad placement is currently booked by any barber
-    const existingAd = await AdPlacement.findOne({
-      isBooked: true,
-      endDate: { $gte: new Date() } // Check if the ad is still active or booked for the future
-    });
-
-    if (existingAd) {
-      return res.status(400).json({ msg: 'An ad placement is currently booked. No new ad placements can be created at this time.' });
+// Create a new ad placement (capture multer errors explicitly)
+router.post('/', auth, (req, res) => {
+  upload.single('media')(req, res, async (uploadErr) => {
+    if (uploadErr) {
+      console.error('Multer upload error:', uploadErr);
+      // Multer error types: LIMIT_FILE_SIZE, etc.
+      return res.status(400).json({ msg: uploadErr.message || 'File upload failed' });
     }
 
-    let adData = {
-      barberId,
-      startDate,
-      endDate,
-      price,
-      status: 'pending',
-      isBooked: true,
-    };
+    try {
+      const { videoUrl, startDate, endDate, price } = req.body;
+      const barberId = req.user.id; // Assuming auth middleware adds user to req
 
-    if (req.file) {
-      adData.mediaUrl = `/uploads/ads/${req.file.filename}`;
-      if (req.file.mimetype.startsWith('image')) {
-        adData.mediaType = 'image';
-      } else if (req.file.mimetype.startsWith('video')) {
-        adData.mediaType = 'video';
+      // Log incoming request for debugging
+      console.log('POST /api/ads - headers content-type:', req.headers['content-type']);
+      console.log('POST /api/ads - body:', { videoUrl, startDate, endDate, price });
+      if (req.file) {
+        console.log('POST /api/ads - file received:', { filename: req.file.filename, mimetype: req.file.mimetype, size: req.file.size });
       }
-    } else if (videoUrl) {
-      adData.videoUrl = videoUrl;
-      adData.mediaType = 'youtube';
-    } else {
-      return res.status(400).json({ msg: 'Please provide a video URL or upload an image/video.' });
+      // Warn if multipart looks suspiciously small (helps detect missing file payloads)
+      if (!req.file && !videoUrl) {
+        const contentLength = Number(req.headers['content-length'] || 0);
+        if (contentLength && contentLength < 200) {
+          console.warn('Incoming multipart/form-data request appears too small (no file): content-length =', contentLength);
+        }
+      }
+
+      // Validate required fields early
+      if (!startDate || !endDate) {
+        return res.status(400).json({ msg: 'startDate and endDate are required' });
+      }
+      const sDate = new Date(startDate);
+      const eDate = new Date(endDate);
+      if (isNaN(sDate.getTime()) || isNaN(eDate.getTime())) {
+        return res.status(400).json({ msg: 'Invalid startDate or endDate' });
+      }
+
+      // Check if any ad placement is currently booked by any barber
+      const existingAd = await AdPlacement.findOne({
+        isBooked: true,
+        endDate: { $gte: new Date() } // Check if the ad is still active or booked for the future
+      });
+
+      if (existingAd) {
+        return res.status(400).json({ msg: 'An ad placement is currently booked. No new ad placements can be created at this time.' });
+      }
+
+      let adData = {
+        barberId,
+        startDate,
+        endDate,
+        price,
+        status: 'pending',
+        isBooked: true,
+      };
+
+      if (req.file) {
+        adData.mediaUrl = `/uploads/ads/${req.file.filename}`;
+        if (req.file.mimetype.startsWith('image')) {
+          adData.mediaType = 'image';
+        } else if (req.file.mimetype.startsWith('video')) {
+          adData.mediaType = 'video';
+        }
+      } else if (videoUrl) {
+        adData.videoUrl = videoUrl;
+        adData.mediaType = 'youtube';
+      } else {
+        console.warn('No file or videoUrl provided. req.headers:', req.headers);
+        return res.status(400).json({ msg: 'Please provide a video URL or upload an image/video.' });
+      }
+
+      const newAd = new AdPlacement(adData);
+
+      const ad = await newAd.save();
+      console.log('Ad placement created:', ad._id);
+      res.json(ad);
+    } catch (err) {
+      console.error('Error in POST /api/ads:', err.stack || err);
+      // If mongoose validation error, return 400 with details
+      if (err.name === 'ValidationError') {
+        const messages = Object.values(err.errors).map(e => e.message);
+        return res.status(400).json({ msg: 'Validation Error', errors: messages });
+      }
+      res.status(500).json({ msg: 'Server Error', error: err.message });
     }
-
-    const newAd = new AdPlacement(adData);
-
-    const ad = await newAd.save();
-    res.json(ad);
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).send('Server Error');
-  }
+  });
 });
 
 // Get active ad for homepage banner

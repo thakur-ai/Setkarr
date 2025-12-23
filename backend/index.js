@@ -4,7 +4,8 @@ const http = require('http');
 const socketIo = require('socket.io');
 const jwt = require('jsonwebtoken'); // Import jsonwebtoken
 const cors = require('cors');
-require('dotenv').config();
+const path = require('path'); // Ensure path is imported if not already
+require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 const startBookingScheduler = require('./utils/bookingScheduler');
 const startNotificationCleaner = require('./utils/notificationCleaner'); // Import the notification cleaner
 
@@ -26,8 +27,6 @@ mongoose.connect(process.env.MONGO_URI)
   })
   .catch(err => console.log(err));
 
-const path = require('path'); // Import path module
-
 app.use(cors());
 app.use(express.json());
 
@@ -48,6 +47,10 @@ app.use('/api/notifications', require('./routes/notifications'));
 app.use('/api/test', require('./routes/test'));
 app.use('/api/chat', require('./routes/chat'));
 app.use('/api/compliance', require('./routes/compliance')); // New compliance route
+app.use('/api/user', require('./routes/user'));
+app.use('/api/exclusive-deals', require('./routes/exclusiveDeals'));
+// Face suggestor API is disabled for maintenance (unregister route)
+// app.use('/api/face-suggestor', require('./routes/faceSuggestor'));
 
 io.on('connection', (socket) => {
   console.log('a user connected');
@@ -104,4 +107,23 @@ app.set('io', io);
 
 server.listen(port, () => {
   console.log(`Server is running on port: ${port}`);
+});
+
+// Log network interfaces for easier debugging when testing from devices
+const os = require('os');
+const nets = os.networkInterfaces();
+Object.keys(nets).forEach((name) => {
+  for (const net of nets[name]) {
+    // skip internal (i.e. 127.0.0.1) and non-IPv4
+    if (net.family === 'IPv4' && !net.internal) {
+      console.log(`Server available at: http://${net.address}:${port}`);
+    }
+  }
+});
+
+// Global error handler (logs stack traces and returns JSON)
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err.stack || err);
+  const status = err.status || 500;
+  res.status(status).json({ msg: err.message || 'Server Error' });
 });

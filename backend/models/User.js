@@ -70,6 +70,29 @@ const userSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Shop'
   }],
+  setkarCoins: {
+    type: Number,
+    default: 0,
+  },
+  completedBookings: {
+    type: Number,
+    default: 0,
+  },
+  loyaltyRewardsEarned: {
+    type: Number,
+    default: 0,
+  },
+  lastLoyaltyRewardDate: {
+    type: Date,
+  },
+  rating: {
+    type: Number,
+    default: 0,
+  },
+  reviews: {
+    type: Number,
+    default: 0,
+  },
 });
 
 const User = mongoose.model('User', userSchema);

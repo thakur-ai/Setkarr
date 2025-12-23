@@ -6,6 +6,10 @@ const shopSchema = new mongoose.Schema({
     ref: 'User',
     required: true,
   },
+  staff: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+  }],
   name: {
     type: String,
     required: true,
@@ -37,6 +41,10 @@ const shopSchema = new mongoose.Schema({
       name: String,
       price: String,
       time: String,
+      barberId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+      },
     },
   ],
   category: {

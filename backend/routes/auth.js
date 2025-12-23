@@ -213,11 +213,19 @@ router.post('/register', async (req, res) => {
   const { name, email, password, phone, role, shopName, shopAddress, shopPhone, category } = req.body;
 
   try {
-    let user = await User.findOne({ $or: [{ email }, { phone }] });
-
-    if (user) {
-      return res.status(400).json({ msg: 'User already exists' });
+    // Check if email already exists
+    let userByEmail = await User.findOne({ email });
+    if (userByEmail) {
+      return res.status(400).json({ msg: 'Email is already registered', field: 'email' });
     }
+
+    // Check if phone already exists
+    let userByPhone = await User.findOne({ phone });
+    if (userByPhone) {
+      return res.status(400).json({ msg: 'Phone number is already registered', field: 'phone' });
+    }
+
+    let user;
 
     user = new User({
       name,
@@ -233,14 +241,33 @@ router.post('/register', async (req, res) => {
     await user.save();
 
     if (role === 'barber') {
-      const shop = new Shop({
-        owner: user.id,
-        name: shopName,
-        address: shopAddress,
-        phone: shopPhone,
-        category,
+      // Check if a shop with the same details already exists
+      const existingShop = await Shop.findOne({
+        $or: [
+          { address: shopAddress },
+          { phone: shopPhone },
+          { name: shopName }
+        ]
       });
-      await shop.save();
+
+      if (existingShop) {
+        // Shop exists - add new barber as staff member
+        if (!existingShop.staff.includes(user.id)) {
+          existingShop.staff.push(user.id);
+          await existingShop.save();
+        }
+        // Note: existingShop.owner remains the original owner
+      } else {
+        // No existing shop - create new shop with this barber as owner
+        const shop = new Shop({
+          owner: user.id,
+          name: shopName,
+          address: shopAddress,
+          phone: shopPhone,
+          category,
+        });
+        await shop.save();
+      }
     }
 
     const payload = {

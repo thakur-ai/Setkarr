@@ -7,7 +7,11 @@ const mongoose = require('mongoose'); // Add mongoose import
 const Booking = require('../models/Booking');
 const User = require('../models/User');
 const Notification = require('../models/Notification');
+const SetkarCoinTransaction = require('../models/SetkarCoinTransaction');
 const auth = require('../middleware/auth');
+
+console.log('RAZORPAY_KEY_ID:', process.env.RAZORPAY_KEY_ID);
+console.log('RAZORPAY_KEY_SECRET:', process.env.RAZORPAY_KEY_SECRET ? 'Loaded' : 'Not Loaded');
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
@@ -90,11 +94,40 @@ router.post('/verify', auth, async (req, res) => {
 // @access  Private
 router.post('/dummy-payment', auth, async (req, res) => {
   try {
-    const { bookingId } = req.body;
+    const { bookingId, coinsUsed } = req.body; // Receive coinsUsed from frontend
     const booking = await Booking.findById(bookingId);
 
     if (!booking) {
       return res.status(404).json({ msg: 'Booking not found' });
+    }
+
+    // Deduct Setkar coins if used
+    if (coinsUsed && coinsUsed > 0) {
+      const user = await User.findById(req.user.id);
+      if (!user) {
+        return res.status(404).json({ msg: 'User not found for coin deduction.' });
+      }
+      if (user.setkarCoins < coinsUsed) {
+        return res.status(400).json({ msg: 'Insufficient Setkar Coins for redemption.' });
+      }
+      user.setkarCoins -= coinsUsed;
+      await user.save();
+
+      // Create transaction record for coin redemption
+      const redemptionTransaction = new SetkarCoinTransaction({
+        userId: user._id,
+        type: 'redeem',
+        amount: coinsUsed,
+        description: `Redeemed ${coinsUsed} Setkar Coins for booking payment`,
+      });
+      await redemptionTransaction.save();
+    }
+
+    // Add 0.5 Setkar Coins as cashback after successful payment
+    const user = await User.findById(req.user.id); // Re-fetch user to ensure latest balance
+    if (user) {
+      user.setkarCoins = (user.setkarCoins || 0) + 0.5;
+      await user.save();
     }
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString(); // 6-digit OTP
