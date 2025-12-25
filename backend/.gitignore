@@ -1,1 +1,17 @@
+# Node
 node_modules/
+
+# Environment files
+.env
+
+# Uploads / user-generated content
+backend/uploads/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS
+.DS_Store
+Thumbs.db

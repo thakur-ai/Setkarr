@@ -8,6 +8,7 @@ const path = require('path'); // Ensure path is imported if not already
 require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 const startBookingScheduler = require('./utils/bookingScheduler');
 const startNotificationCleaner = require('./utils/notificationCleaner'); // Import the notification cleaner
+const { scheduleDailyReset } = require('./utils/dailyReset'); // Import the daily reset scheduler
 
 const app = express();
 const server = http.createServer(app);
@@ -24,6 +25,7 @@ mongoose.connect(process.env.MONGO_URI)
     console.log('MongoDB Connected');
     startBookingScheduler(); // Start the booking scheduler after DB connection
     startNotificationCleaner(); // Start the notification cleaner after DB connection
+    scheduleDailyReset(); // Start the daily reset scheduler after DB connection
   })
   .catch(err => console.log(err));
 
@@ -36,6 +38,8 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/shop', require('./routes/shop'));
+app.use('/api/barber-card', require('./routes/barberCard'));
+app.use('/api/liked-barbers', require('./routes/likedBarbers'));
 app.use('/api/password', require('./routes/password'));
 app.use('/api/safety', require('./routes/safety'));
 app.use('/api/payment', require('./routes/payment'));

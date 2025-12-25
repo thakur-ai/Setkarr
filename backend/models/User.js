@@ -62,13 +62,20 @@ const userSchema = new mongoose.Schema({
     type: Number,
     default: 10,
   },
-  likedBarbers: [{
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Shop'
-  }],
-  likedSalons: [{
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Shop'
+  likedProviders: [{
+    providerId: {
+      type: mongoose.Schema.Types.ObjectId,
+      required: true
+    },
+    providerType: {
+      type: String,
+      enum: ['barber', 'shop'],
+      required: true
+    },
+    likedAt: {
+      type: Date,
+      default: Date.now
+    }
   }],
   setkarCoins: {
     type: Number,
@@ -92,6 +99,14 @@ const userSchema = new mongoose.Schema({
   reviews: {
     type: Number,
     default: 0,
+  },
+  todaysBookings: {
+    type: Number,
+    default: 0,
+  },
+  isAvailable: {
+    type: Boolean,
+    default: true,
   },
 });
 

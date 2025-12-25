@@ -6,6 +6,10 @@ const User = require('../models/User');
 const SetkarCoinTransaction = require('../models/SetkarCoinTransaction');
 const auth = require('../middleware/auth');
 
+// Simple in-memory cache for premium availability (use Redis in production)
+const premiumCache = new Map();
+const CACHE_DURATION = 10 * 60 * 1000; // 10 minutes
+
 // Helper function to get priority value
 const getPriorityValue = (appointment) => {
   const type = appointment.appointmentType;
@@ -57,6 +61,71 @@ router.get('/barber', auth, async (req, res) => {
       .sort({ date: -1, time: 1 }); // Sort by date (desc) and time (asc)
     console.log('Bookings:', bookings);
     res.json(bookings);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ msg: err.message });
+  }
+});
+
+// @route   GET api/booking/barber/:barberId/all
+// @desc    Get all bookings for a specific barber (for shop statistics)
+// @access  Public
+router.get('/barber/:barberId/all', async (req, res) => {
+  try {
+    const bookings = await Booking.find({
+      barberId: req.params.barberId,
+      status: { $ne: 'cancelled' }
+    }).sort({ date: -1, time: 1 });
+
+    res.json(bookings);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ msg: err.message });
+  }
+});
+
+// @route   GET api/booking/check-premium-availability-batch
+// @desc    Check premium availability for multiple barbers at once (NO CACHING for real-time accuracy)
+// @access  Private
+router.get('/check-premium-availability-batch', auth, async (req, res) => {
+  try {
+    const { barberIds, date } = req.query;
+
+    if (!barberIds || !date) {
+      return res.status(400).json({ msg: 'barberIds and date are required' });
+    }
+
+    const ids = barberIds.split(',');
+    const queryDate = new Date(date);
+    queryDate.setHours(0, 0, 0, 0);
+    const nextDay = new Date(queryDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+
+    const barbers = await User.find({ _id: { $in: ids } });
+
+    const results = {};
+    for (const barber of barbers) {
+      const todaysBookings = await Booking.countDocuments({
+        barberId: barber._id,
+        date: { $gte: queryDate, $lt: nextDay },
+        status: { $ne: 'cancelled' },
+      });
+
+      if (todaysBookings < barber.maxAppointmentsPerDay) {
+        const remainingSlots = barber.maxAppointmentsPerDay - todaysBookings;
+        results[barber._id] = { type: 'free', count: remainingSlots };
+      } else {
+        const replaceableBookings = await Booking.countDocuments({
+          barberId: barber._id,
+          date: { $gte: queryDate, $lt: nextDay },
+          status: { $nin: ['started', 'completed', 'cancelled'] },
+          appointmentType: { $in: ['Free', 'Basic', 'Premium'] },
+        });
+        results[barber._id] = { type: 'premium', count: replaceableBookings };
+      }
+    }
+
+    res.json(results);
   } catch (err) {
     console.error(err.message);
     res.status(500).json({ msg: err.message });
@@ -481,6 +550,13 @@ router.put('/complete/:id', auth, async (req, res) => {
     }
     await booking.save();
 
+    // Increment todaysBookings for the barber
+    const barberUser = await User.findById(booking.barberId);
+    if (barberUser) {
+      barberUser.todaysBookings = (barberUser.todaysBookings || 0) + 1;
+      await barberUser.save();
+    }
+
     const updatedBooking = await Booking.findById(req.params.id).populate('userId', 'name email profilePicture phone gender language');
 
     // Award 1 Setkar coin to the user upon booking completion
@@ -846,6 +922,51 @@ router.get('/barber-appointments/:barberId', auth, async (req, res) => {
   }
 });
 
+// @route   GET api/booking/barber-appointments-batch
+// @desc    Get all bookings for multiple barbers on a specific date (for calculating todays bookings)
+// @access  Private
+router.get('/barber-appointments-batch', auth, async (req, res) => {
+  try {
+    const { barberIds, date } = req.query;
+
+    if (!barberIds || !date) {
+      return res.status(400).json({ msg: 'barberIds and date are required' });
+    }
+
+    const ids = barberIds.split(',');
+    const queryDate = new Date(date);
+    queryDate.setHours(0, 0, 0, 0);
+    const nextDay = new Date(queryDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+
+    const bookings = await Booking.find({
+      barberId: { $in: ids },
+      date: {
+        $gte: queryDate,
+        $lt: nextDay,
+      },
+      status: { $ne: 'cancelled' },
+    }).select('barberId status').sort({ createdAt: 1 });
+
+    // Group bookings by barberId and count confirmed/started bookings
+    const bookingCounts = {};
+    ids.forEach(id => {
+      bookingCounts[id] = 0;
+    });
+
+    bookings.forEach(booking => {
+      if (booking.status === 'confirmed' || booking.status === 'started') {
+        bookingCounts[booking.barberId.toString()] = (bookingCounts[booking.barberId.toString()] || 0) + 1;
+      }
+    });
+
+    res.json(bookingCounts);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ msg: err.message });
+  }
+});
+
 // @route   GET api/booking/check-premium-availability/:barberId
 // @desc    Check if a Black Premium appointment can be booked
 // @access  Private
@@ -887,6 +1008,63 @@ router.get('/check-premium-availability/:barberId', auth, async (req, res) => {
     console.log(`Found ${replaceableBookings} replaceable bookings for barber ${barberId}`);
 
     res.json({ type: 'premium', count: replaceableBookings });
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ msg: err.message });
+  }
+});
+
+// @route   GET api/booking/check-premium-availability-batch
+// @desc    Check premium availability for multiple barbers at once
+// @access  Private
+router.get('/check-premium-availability-batch', auth, async (req, res) => {
+  try {
+    const { barberIds, date } = req.query;
+
+    if (!barberIds || !date) {
+      return res.status(400).json({ msg: 'barberIds and date are required' });
+    }
+
+    const cacheKey = `premium_batch_${barberIds}_${date}`;
+    // const cached = premiumCache.get(cacheKey);
+    // if (cached && (Date.now() - cached.timestamp) < CACHE_DURATION) {
+    //   return res.json(cached.data);
+    // }
+
+    const ids = barberIds.split(',');
+    const queryDate = new Date(date);
+    queryDate.setHours(0, 0, 0, 0);
+    const nextDay = new Date(queryDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+
+    const barbers = await User.find({ _id: { $in: ids } });
+
+    const results = {};
+    for (const barber of barbers) {
+      const todaysBookings = await Booking.countDocuments({
+        barberId: barber._id,
+        date: { $gte: queryDate, $lt: nextDay },
+        status: { $ne: 'cancelled' },
+      });
+
+      if (todaysBookings < barber.maxAppointmentsPerDay) {
+        const remainingSlots = barber.maxAppointmentsPerDay - todaysBookings;
+        results[barber._id] = { type: 'free', count: remainingSlots };
+      } else {
+        const replaceableBookings = await Booking.countDocuments({
+          barberId: barber._id,
+          date: { $gte: queryDate, $lt: nextDay },
+          status: { $nin: ['started', 'completed', 'cancelled'] },
+          appointmentType: { $in: ['Free', 'Basic', 'Premium'] },
+        });
+        results[barber._id] = { type: 'premium', count: replaceableBookings };
+      }
+    }
+
+    // Cache the results
+    premiumCache.set(cacheKey, { data: results, timestamp: Date.now() });
+
+    res.json(results);
   } catch (err) {
     console.error(err.message);
     res.status(500).json({ msg: err.message });

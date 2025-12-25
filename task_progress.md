@@ -1,16 +1,13 @@
-# Task: Improve Shadow Styling for barberCard
+# PetCareSearchScreen Implementation Task
 
-## Steps:
-- [ ] Locate BarberSearchScreen.jsx file in customer-app
-- [ ] Examine current barberCard styling
-- [ ] Analyze current shadow properties
-- [ ] Design improved shadow styling
-- [ ] Implement enhanced shadow effects
-- [ ] Test and verify the visual improvement
-
-## Current Shadow Properties:
-- shadowColor: 'rgba(0,0,0,0.8)'
-- shadowOffset: { width: 0, height: 15 }
-- shadowOpacity: 0.6
-- shadowRadius: 25
-- elevation: 25
+- [x] Analyze BarberSearchScreen.jsx structure and functionality
+- [x] Examine current PetCareSearchScreen.jsx implementation
+- [x] Identify differences and needed adaptations for pet care services
+- [ ] Update TopToastAlert component to match barber version
+- [ ] Update PetCareCardItem component with advanced features from BarberCardItem
+- [ ] Add ShopDetailsSheet component for pet care shops
+- [ ] Update main component logic and imports
+- [ ] Add premium availability tracking
+- [ ] Add animated filters and better search functionality
+- [ ] Update styles to match premium UI
+- [ ] Test the implementation

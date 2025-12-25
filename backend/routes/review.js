@@ -36,6 +36,13 @@ router.post('/', auth, async (req, res) => {
 
     await review.save();
 
+    // Increment barber's reviews count
+    const barber = await User.findById(booking.barberId);
+    if (barber) {
+      barber.reviews = (barber.reviews || 0) + 1;
+      await barber.save();
+    }
+
     // Update shop rating
     const shop = await Shop.findOne({ owner: booking.barberId });
     if (shop) {
@@ -90,6 +97,22 @@ router.get('/customer/:customerId/barber/:barberId', auth, async (req, res) => {
     res.json(reviews);
   } catch (err) {
     console.error('Backend Error fetching customer reviews:', err.message); // More specific error log
+    res.status(500).send('Server Error');
+  }
+});
+
+// @route   GET api/reviews/barber/:barberId
+// @desc    Get all reviews for a barber
+// @access  Public
+router.get('/barber/:barberId', async (req, res) => {
+  try {
+    const reviews = await Review.find({ barberId: req.params.barberId })
+      .populate('userId', 'name profilePicture')
+      .sort({ createdAt: -1 });
+
+    res.json(reviews);
+  } catch (err) {
+    console.error(err.message);
     res.status(500).send('Server Error');
   }
 });

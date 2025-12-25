@@ -3,10 +3,16 @@ const router = express.Router();
 const auth = require('../middleware/auth');
 const Shop = require('../models/Shop');
 const Booking = require('../models/Booking');
+const BarberCard = require('../models/BarberCard');
+const User = require('../models/User');
 const ListingPlace = require('../models/ListingPlace');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+
+// Simple in-memory cache for shop data (use Redis in production)
+const shopCache = new Map();
+const SHOP_CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 
 // Ensure the uploads directory exists
 const uploadsDir = path.join(__dirname, '../../barber-app/Uploads');
@@ -181,7 +187,7 @@ router.get('/', auth, async (req, res) => {
 // @desc    Update user's shop
 // @access  Private
 router.put('/', auth, async (req, res) => {
-  const { name, address, phone, services, tag, location, avgAppointmentTime, isAvailable, image, upiId } = req.body;
+  const { name, address, phone, services, tag, location, avgAppointmentTime, isAvailable, image, upiId, operatingHours } = req.body;
 
   try {
     let shop = await Shop.findOne({ owner: req.user.id });
@@ -201,6 +207,7 @@ router.put('/', auth, async (req, res) => {
     if (isAvailable !== undefined) shop.isAvailable = isAvailable;
     if (image) shop.image = image; // Add image update
     if (upiId) shop.upiId = upiId;
+    if (operatingHours) shop.operatingHours = operatingHours;
 
     await shop.save();
     res.json(shop);
@@ -262,93 +269,114 @@ router.put('/confirm-listing', auth, async (req, res) => {
 });
 
 // @route   GET api/shop/all
-// @desc    Get all shops
+// @desc    Get all shops (HEAVILY OPTIMIZED - NO CACHING for real-time availability)
 // @access  Public
 router.get('/all', async (req, res) => {
   try {
-    const { category } = req.query;
+    const { category, page, limit } = req.query;
     let filter = {};
     if (category) {
-      // Allow multiple categories to be passed as a comma-separated string
       filter.category = { $in: category.split(',') };
     }
 
-    const shops = await Shop.find(filter)
-      .populate('owner', 'name profilePicture maxAppointmentsPerDay')
+    // 1. Pagination Setup
+    const pageNum = parseInt(page) || 1;
+    const limitNum = parseInt(limit) || 0; // 0 means no limit (backward compatibility)
+    const skip = limitNum > 0 ? (pageNum - 1) * limitNum : 0;
+
+    // 2. Fetch Shops with Pagination
+    let shopQuery = Shop.find(filter)
+      .populate('owner', 'name email phone profilePicture maxAppointmentsPerDay rating reviews isAvailable')
+      .populate('staff', 'name email phone profilePicture maxAppointmentsPerDay rating reviews isAvailable')
       .populate({
         path: 'selectedListingPlace',
-        populate: {
-          path: 'lockedBy',
-          select: 'name profilePicture',
-        },
-      });
-    
-    const shopsWithBookingCounts = await Promise.all(shops.map(async (shop) => {
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      const tomorrow = new Date(today);
-      tomorrow.setDate(tomorrow.getDate() + 1);
-
-      const todaysBookings = await Booking.countDocuments({
-        barberId: shop.owner._id,
-        date: {
-          $gte: today,
-          $lt: tomorrow,
-        },
-        status: { $ne: 'cancelled' },
+        populate: { path: 'lockedBy', select: 'name profilePicture' },
       });
 
-      // Calculate shop rating as average of all barbers (owner + staff)
-      let totalRating = shop.rating || 0;
-      let totalReviews = shop.reviews || 0;
-      let barberCount = 1; // Start with owner
+    // Only apply DB limit if we aren't doing complex sorting in memory later
+    if (limitNum > 0) {
+       shopQuery = shopQuery.skip(skip).limit(limitNum);
+    }
 
-      // Add ratings from staff members
-      if (shop.staff && shop.staff.length > 0) {
-        console.log(`Shop ${shop._id} has ${shop.staff.length} staff members`);
-        for (const staffId of shop.staff) {
-          try {
-            // Get staff member rating from User model (not Shop model)
-            const User = require('../models/User');
-            const staffUser = await User.findById(staffId).select('rating reviews');
-            if (staffUser) {
-              console.log(`Staff ${staffId}: rating=${staffUser.rating}, reviews=${staffUser.reviews}`);
-              // Include staff even with rating 0, but only count towards average if they have a rating
-              totalReviews += staffUser.reviews || 0;
-              if (staffUser.rating > 0) {
-                totalRating += staffUser.rating;
-                barberCount++;
-              }
-            } else {
-              console.log(`Staff ${staffId} not found in User model`);
-            }
-          } catch (err) {
-            console.error('Error fetching staff rating:', err);
+    const shops = await shopQuery;
+
+    // 3. Batch Fetch User Data (Solving N+1 Problem)
+    const allBarberIds = [];
+    shops.forEach(shop => {
+      if (shop.owner) allBarberIds.push(shop.owner._id);
+      if (shop.staff) allBarberIds.push(...shop.staff.map(s => s._id));
+    });
+
+    const allBarbers = await User.find({ _id: { $in: allBarberIds } })
+      .select('maxAppointmentsPerDay todaysBookings reviews rating isAvailable');
+
+    const barberMap = new Map();
+    allBarbers.forEach(b => barberMap.set(b._id.toString(), b));
+
+    // 4. Process Data in Memory
+    const shopsWithBookingCounts = shops.map((shop) => {
+      const owner = shop.owner ? barberMap.get(shop.owner._id.toString()) : null;
+      const staffMembers = shop.staff ? shop.staff.map(s => barberMap.get(s._id.toString())).filter(Boolean) : [];
+
+      const shopBarbers = [owner, ...staffMembers].filter(Boolean);
+      const availableBarbers = shopBarbers.filter(b => b.isAvailable && b.maxAppointmentsPerDay > 0);
+      const hasAnyAvailableBarber = shopBarbers.some(b => b.isAvailable);
+
+      const todaysBookings = availableBarbers.reduce((sum, b) => sum + (b.todaysBookings || 0), 0);
+      const totalMaxAppointments = availableBarbers.reduce((sum, b) => sum + (b.maxAppointmentsPerDay || 0), 0);
+
+      // Calculate average rating from all barbers (owner + staff) using populated data
+      // Only include barbers with rating > 0
+      let totalRating = 0;
+      let totalReviews = 0;
+      let barberCount = 0;
+
+      if (shop.owner && shop.owner.rating > 0) {
+        totalRating += shop.owner.rating;
+        totalReviews += shop.owner.reviews || 0;
+        barberCount++;
+      }
+
+      if (shop.staff) {
+        shop.staff.forEach(staffUser => {
+          if (staffUser.rating > 0) {
+            totalRating += staffUser.rating;
+            totalReviews += staffUser.reviews || 0;
+            barberCount++;
           }
-        }
-      } else {
-        console.log(`Shop ${shop._id} has no staff members`);
+        });
       }
 
       const averageRating = barberCount > 0 ? totalRating / barberCount : 0;
 
       return {
         ...shop.toObject(),
+        rating: averageRating, // Override shop rating with barber average
         todaysBookings,
+        totalMaxAppointments,
+        isAvailable: hasAnyAvailableBarber,
         shopRating: averageRating,
         totalBarbers: barberCount,
         totalReviews: totalReviews,
       };
-    }));
-
-    // Sort by listing tier
-    shopsWithBookingCounts.sort((a, b) => {
-      const tierA = a.selectedListingPlace ? a.selectedListingPlace.tierId : Infinity;
-      const tierB = b.selectedListingPlace ? b.selectedListingPlace.tierId : Infinity;
-      return tierA - tierB;
     });
 
-    res.json(shopsWithBookingCounts);
+    // 5. Sort by listing tier (only if not paginated, or apply to full dataset)
+    if (limitNum === 0) {
+      shopsWithBookingCounts.sort((a, b) => {
+        const tierA = a.selectedListingPlace ? a.selectedListingPlace.tierId : Infinity;
+        const tierB = b.selectedListingPlace ? b.selectedListingPlace.tierId : Infinity;
+        return tierA - tierB;
+      });
+    }
+
+    // 6. Apply Pagination Slicing if needed
+    let result = shopsWithBookingCounts;
+    if (limitNum > 0 && skip > 0) {
+      result = shopsWithBookingCounts.slice(skip, skip + limitNum);
+    }
+
+    res.json(result);
   } catch (err) {
     console.error(err.message);
     res.status(500).send('Server Error');
@@ -661,7 +689,7 @@ router.get('/services/:userId', auth, async (req, res) => {
     }
     res.json(shop.services);
   } catch (err) {
-    console.error('Error fetching services by user ID:', err);
+    console.error('Error fetching services by user ID:', err); 
     res.status(500).send('Server Error');
   }
 });

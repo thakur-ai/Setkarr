@@ -168,7 +168,7 @@ router.get('/user/:id', auth, async (req, res) => {
 // @desc    Update user profile
 // @access  Private
 router.put('/user', auth, async (req, res) => {
-  const { name, phone, gender, language, profilePicture, notificationsEnabled, shopName, shopAddress, shopPhone, shopImage, maxAppointmentsPerDay } = req.body;
+  const { name, phone, gender, language, profilePicture, notificationsEnabled, shopName, shopAddress, shopPhone, shopImage, maxAppointmentsPerDay, isAvailable } = req.body;
   const userId = req.user.id;
 
   try {
@@ -185,6 +185,7 @@ router.put('/user', auth, async (req, res) => {
     if (profilePicture) user.profilePicture = profilePicture;
     if (notificationsEnabled !== undefined) user.notificationsEnabled = notificationsEnabled;
     if (maxAppointmentsPerDay) user.maxAppointmentsPerDay = maxAppointmentsPerDay;
+    if (isAvailable !== undefined) user.isAvailable = isAvailable;
 
     await user.save();
 
@@ -241,32 +242,63 @@ router.post('/register', async (req, res) => {
     await user.save();
 
     if (role === 'barber') {
-      // Check if a shop with the same details already exists
-      const existingShop = await Shop.findOne({
-        $or: [
-          { address: shopAddress },
-          { phone: shopPhone },
-          { name: shopName }
-        ]
-      });
+      console.log('Creating shop for barber:', user.email);
+      console.log('Shop details:', { shopName, shopAddress, shopPhone, category });
 
-      if (existingShop) {
-        // Shop exists - add new barber as staff member
-        if (!existingShop.staff.includes(user.id)) {
-          existingShop.staff.push(user.id);
-          await existingShop.save();
-        }
-        // Note: existingShop.owner remains the original owner
-      } else {
-        // No existing shop - create new shop with this barber as owner
-        const shop = new Shop({
-          owner: user.id,
-          name: shopName,
-          address: shopAddress,
-          phone: shopPhone,
-          category,
+      try {
+        // Check if a shop with the same details already exists
+        const existingShop = await Shop.findOne({
+          $or: [
+            { address: shopAddress },
+            { phone: shopPhone },
+            { name: shopName }
+          ]
         });
-        await shop.save();
+
+        console.log('Existing shop check result:', existingShop ? 'Found existing shop' : 'No existing shop');
+
+        if (existingShop) {
+          // Shop exists - add new barber as staff member
+          console.log('Adding barber as staff to existing shop');
+          if (!existingShop.staff.includes(user.id)) {
+            existingShop.staff.push(user.id);
+            await existingShop.save();
+            console.log('Barber added as staff successfully');
+          } else {
+            console.log('Barber already staff at this shop');
+          }
+          // Note: existingShop.owner remains the original owner
+        } else {
+          // No existing shop - create new shop with this barber as owner
+          console.log('Creating new shop for barber');
+          console.log('User ID:', user.id);
+          console.log('Shop data:', { owner: user.id, name: shopName, address: shopAddress, phone: shopPhone, category });
+
+          const shop = new Shop({
+            owner: user.id,
+            name: shopName,
+            address: shopAddress,
+            phone: shopPhone,
+            category,
+          });
+
+          // Validate before saving
+          const validationError = shop.validateSync();
+          if (validationError) {
+            console.error('Shop validation error:', validationError);
+            return res.status(400).json({
+              msg: 'Shop validation failed',
+              error: validationError.message,
+              field: Object.keys(validationError.errors)[0]
+            });
+          }
+
+          await shop.save();
+          console.log('New shop created successfully:', shop._id);
+        }
+      } catch (shopError) {
+        console.error('Shop creation error:', shopError);
+        return res.status(500).json({ msg: 'Failed to create shop', error: shopError.message });
       }
     }
 
@@ -278,7 +310,7 @@ router.post('/register', async (req, res) => {
 
     jwt.sign(
       payload,
-      'secret',
+      process.env.JWT_SECRET || 'secret',
       {
         expiresIn: 360000,
       },
@@ -300,15 +332,24 @@ router.post('/login', async (req, res) => {
   const { email, password } = req.body;
 
   try {
+    console.log('Login attempt for email:', email);
+
     let user = await User.findOne({ email });
 
     if (!user) {
+      console.log('User not found for email:', email);
       return res.status(400).json({ msg: 'Invalid Credentials' });
     }
 
+    console.log('User found:', user.email, 'Role:', user.role);
+    console.log('Stored password hash exists:', !!user.password);
+
     const isMatch = await bcrypt.compare(password, user.password);
 
+    console.log('Password match result:', isMatch);
+
     if (!isMatch) {
+      console.log('Password does not match for user:', email);
       return res.status(400).json({ msg: 'Invalid Credentials' });
     }
 
@@ -320,17 +361,21 @@ router.post('/login', async (req, res) => {
 
     jwt.sign(
       payload,
-      'secret',
+      process.env.JWT_SECRET || 'secret',
       {
         expiresIn: 360000,
       },
       (err, token) => {
-        if (err) throw err;
+        if (err) {
+          console.error('JWT signing error:', err);
+          throw err;
+        }
+        console.log('Login successful for user:', email);
         res.json({ token });
       }
     );
   } catch (err) {
-    console.error(err.message);
+    console.error('Login error:', err.message);
     res.status(500).send('Server Error');
   }
 });
@@ -366,7 +411,7 @@ router.post('/barber/login', async (req, res) => {
 
     jwt.sign(
       payload,
-      'secret',
+      process.env.JWT_SECRET || 'secret',
       {
         expiresIn: 360000,
       },
@@ -478,6 +523,29 @@ router.post('/unlikeSalon', auth, async (req, res) => {
     await user.save();
 
     res.json(user);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Server Error');
+  }
+});
+
+// @route   PUT api/auth/availability
+// @desc    Update user availability status
+// @access  Private
+router.put('/availability', auth, async (req, res) => {
+  const { isAvailable } = req.body;
+
+  try {
+    const user = await User.findById(req.user.id);
+
+    if (!user) {
+      return res.status(404).json({ msg: 'User not found' });
+    }
+
+    user.isAvailable = isAvailable;
+    await user.save();
+
+    res.json({ msg: 'Availability updated', isAvailable: user.isAvailable });
   } catch (err) {
     console.error(err.message);
     res.status(500).send('Server Error');

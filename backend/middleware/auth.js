@@ -12,7 +12,7 @@ module.exports = async function (req, res, next) {
 
   // Verify token
   try {
-    const decoded = jwt.verify(token, 'secret');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
     req.user = await User.findById(decoded.user.id).select('-password');
     if (!req.user) {
       return res.status(401).json({ msg: 'User not found, authorization denied' });
